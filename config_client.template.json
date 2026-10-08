@@ -1,0 +1,21 @@
+{
+  "http_server": {
+    "host": "127.0.0.1",
+    "port": 5499
+  },
+  "display": {
+    "max_calls_on_screen": 15,
+    "font_scale_mode": "auto",
+    "green_threshold_minutes": 5,
+    "orange_threshold_minutes": 15,
+    "color_green": "#2e7d32",
+    "color_orange": "#f57c00",
+    "color_red": "#c62828",
+    "color_bright_green": "#00c853",
+    "color_background": "#1e1e1e",
+    "color_text": "#ffffff",
+    "logo_path": "",
+    "cache_ttl_days": 3,
+    "allowed_types": []
+  }
+}

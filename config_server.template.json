@@ -1,0 +1,13 @@
+{
+  "http_server": {
+    "host": "0.0.0.0",
+    "port": 5499
+  },
+  "display": {
+    "cache_ttl_days": 3
+  },
+  "warehouse": {
+    "enabled": true,
+    "warehouses": []
+  }
+}

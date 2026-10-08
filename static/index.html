@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CallNotifier - Панель мониторинга</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1e1e2e 0%, #2d2d44 100%);
+            min-height: 100vh;
+            color: #ffffff;
+        }
+        #init-screen {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(135deg, #1e1e2e 0%, #2d2d44 100%);
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            z-index: 1000; transition: opacity 0.5s;
+        }
+        #init-screen.hidden { opacity: 0; pointer-events: none; }
+        .init-button {
+            padding: 1rem 3rem; font-size: 1.2rem; font-weight: 600; color: #fff;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none; border-radius: 50px; cursor: pointer;
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4); transition: transform 0.2s;
+        }
+        .init-button:hover { transform: translateY(-3px); }
+        #main-interface { display: none; padding: 2rem; max-width: 1600px; margin: 0 auto; }
+        #main-interface.active { display: block; animation: fadeIn 0.5s; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 2rem; padding: 1.5rem 2rem;
+            background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px);
+            border-radius: 20px; border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .header-title { font-size: 2rem; font-weight: 700; }
+        .connection-status {
+            display: flex; align-items: center; gap: 0.5rem;
+            padding: 0.5rem 1rem; background: rgba(255, 255, 255, 0.05); border-radius: 50px;
+        }
+        .status-dot {
+            width: 12px; height: 12px; border-radius: 50%; background: #00ff00;
+            box-shadow: 0 0 10px #00ff00; animation: pulse 2s infinite;
+        }
+        .status-dot.disconnected { background: #ff0000; box-shadow: 0 0 10px #ff0000; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .cards-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 1.5rem;
+        }
+        .call-card {
+            background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px);
+            border-radius: 20px; padding: 1.5rem; border: 1px solid rgba(255, 255, 255, 0.1);
+            animation: slideIn 0.5s;
+        }
+        @keyframes slideIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        .call-card.green { border-left: 4px solid #2ecc71; }
+        .call-card.orange { border-left: 4px solid #f39c12; }
+        .call-card.red { border-left: 4px solid #e74c3c; animation: slideIn 0.5s, blink 2s infinite; }
+        @keyframes blink { 0%, 100% { background: rgba(231, 76, 60, 0.1); } 50% { background: rgba(231, 76, 60, 0.25); } }
+        .card-header { display: flex; justify-content: space-between; margin-bottom: 1rem; color: #a0a0b0; font-size: 0.9rem; }
+        .card-name { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .card-equipment { font-size: 1.1rem; color: #c0c0d0; margin-bottom: 1rem; }
+        .empty-state { text-align: center; padding: 4rem; color: #a0a0b0; grid-column: 1 / -1; }
+    </style>
+</head>
+<body>
+    <div id="init-screen">
+        <h1 style="font-size: 3rem; margin-bottom: 2rem; background: linear-gradient(135deg, #667eea, #764ba2); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">CallNotifier</h1>
+        <p style="font-size: 1.2rem; color: #a0a0b0; margin-bottom: 2rem;">Система мониторинга вызовов и оповещений</p>
+        <button class="init-button" id="start-button">🚀 Запустить панель мониторинга</button>
+    </div>
+
+    <div id="main-interface">
+        <div class="header">
+            <h1 class="header-title" id="header-title">Ожидание вызовов</h1>
+            <div class="connection-status">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">Подключено</span>
+            </div>
+        </div>
+        <div class="cards-grid" id="cards-grid">
+            <div class="empty-state">📭 Нет активных вызовов</div>
+        </div>
+    </div>
+
+    <script>
+        let audioContext = null;
+        let isInitialized = false;
+        let playedAudioFiles = new Set();
+        let currentCalls = [];
+
+        document.getElementById('start-button').addEventListener('click', async () => {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            await audioContext.resume();
+            isInitialized = true;
+            document.getElementById('init-screen').classList.add('hidden');
+            document.getElementById('main-interface').classList.add('active');
+            setInterval(syncWithServer, 5000);
+            syncWithServer();
+        });
+
+        async function syncWithServer() {
+            try {
+                const response = await fetch('/api/v1/sync');
+                if (!response.ok) throw new Error('Network error');
+                const data = await response.json();
+                updateConnectionStatus(true);
+                handleSync(data);
+            } catch (error) {
+                updateConnectionStatus(false);
+            }
+        }
+
+        function updateConnectionStatus(isConnected) {
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+            const title = document.getElementById('header-title');
+            if (isConnected) {
+                dot.classList.remove('disconnected');
+                text.textContent = 'Подключено';
+                if (currentCalls.length > 0) title.textContent = `Активные вызовы: ${currentCalls.length}`;
+                else title.textContent = 'Ожидание вызовов';
+            } else {
+                dot.classList.add('disconnected');
+                text.textContent = 'Нет соединения';
+                title.textContent = '⚠ Нет соединения с сервером';
+                title.style.color = '#ff0000';
+            }
+        }
+
+        function handleSync(data) {
+            currentCalls = data.calls || [];
+            if (isInitialized && currentCalls.length > 0) {
+                document.getElementById('header-title').textContent = `Активные вызовы: ${currentCalls.length}`;
+                document.getElementById('header-title').style.color = '#ffffff';
+            }
+            renderCards(currentCalls);
+            checkNewAudio(currentCalls);
+            checkReminders(data.reminders_due || {});
+        }
+
+        function renderCards(calls) {
+            const grid = document.getElementById('cards-grid');
+            if (calls.length === 0) {
+                grid.innerHTML = '<div class="empty-state">📭 Нет активных вызовов</div>';
+                return;
+            }
+            grid.innerHTML = calls.map(call => {
+                const elapsed = Math.floor((Date.now() / 1000 - call.datetime_start) / 60);
+                let colorClass = 'green';
+                if (elapsed >= 15) colorClass = 'red';
+                else if (elapsed >= 5) colorClass = 'orange';
+                return `
+                    <div class="call-card ${colorClass}">
+                        <div class="card-header">
+                            <span>${call.type.toUpperCase()}</span>
+                            <span>${elapsed} мин.</span>
+                        </div>
+                        <div class="card-name">${call.name}</div>
+                        <div class="card-equipment">${call.equipment}</div>
+                        <div style="color: #a0a0b0;">⏱️ Ожидание: ${elapsed} мин.</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function checkNewAudio(calls) {
+            if (!isInitialized) return;
+            calls.forEach(call => {
+                if (call.audio_filename && call.audio_size > 0) {
+                    if (!playedAudioFiles.has(call.audio_filename)) {
+                        playedAudioFiles.add(call.audio_filename);
+                        playAudio(call.audio_filename);
+                    }
+                }
+            });
+            const currentFilenames = new Set(calls.map(c => c.audio_filename).filter(Boolean));
+            playedAudioFiles.forEach(f => {
+                if (!currentFilenames.has(f)) playedAudioFiles.delete(f);
+            });
+        }
+
+        async function playAudio(filename) {
+            try {
+                const response = await fetch(`/api/v1/audio/${filename}`);
+                if (!response.ok) throw new Error('Audio fetch failed');
+                const arrayBuffer = await response.arrayBuffer();
+                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.start(0);
+            } catch (error) {
+                console.error('Ошибка воспроизведения:', error);
+            }
+        }
+
+        // Напоминания: играем один раз на каждое новое срабатывание серверного таймера.
+        // Файл напоминания перезаписывается сервером при изменении состава вызовов,
+        // поэтому сравниваем не только имя, но и размер файла (из заголовка Content-Length).
+        let playedReminders = {};   // filename -> size string
+        let reminderQueue = Promise.resolve();
+
+        function checkReminders(remindersDue) {
+            if (!isInitialized) return;
+            Object.values(remindersDue).forEach(filename => {
+                if (!filename) return;
+                if (playedReminders[filename] === undefined) {
+                    playedReminders[filename] = null; // резервируем, чтобы не запускать дважды
+                    reminderQueue = reminderQueue
+                        .then(() => playReminder(filename))
+                        .then(size => { playedReminders[filename] = size; })
+                        .catch(() => { delete playedReminders[filename]; });
+                }
+            });
+            // Удаляем из памяти файлы напоминаний, которые сервер больше не присылает
+            const active = new Set(Object.values(remindersDue));
+            Object.keys(playedReminders).forEach(f => {
+                if (!active.has(f)) delete playedReminders[f];
+            });
+        }
+
+        async function playReminder(filename) {
+            const response = await fetch(`/api/v1/audio/${filename}`);
+            if (!response.ok) throw new Error('Audio fetch failed');
+            const size = response.headers.get('Content-Length') || String((await response.clone().arrayBuffer()).byteLength);
+            if (playedReminders[filename] === size) return size; // этот же файл уже играли
+            const arrayBuffer = await response.arrayBuffer();
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            return new Promise(resolve => {
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.onended = () => resolve(size);
+                source.start(0);
+            });
+        }
+    </script>
+</body>
+</html>

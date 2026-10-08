@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CallNotifier — Админ-панель</title>
+    <link rel="stylesheet" href="/static/admin/admin.css">
+</head>
+<body>
+
+<!-- ===================== ХЕДЕР ===================== -->
+<header class="header">
+    <div class="header-left">
+        <h1 class="header-title">CallNotifier · Админ-панель</h1>
+        <span class="header-subtitle" id="header-host">—</span>
+    </div>
+    <div class="header-right">
+        <span class="status-dot" id="conn-dot" title="Соединение с сервером"></span>
+        <span class="header-time" id="header-time">--:--:--</span>
+        <button class="btn btn-secondary" id="btn-refresh" title="Обновить текущий таб">↻ Обновить</button>
+    </div>
+</header>
+
+<!-- ===================== ТАБЫ ===================== -->
+<nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="dashboard">📊 Дашборд</button>
+    <button class="tab" data-tab="create">➕ Создать вызов</button>
+    <button class="tab" data-tab="types">🏷️ Типы вызовов</button>
+    <button class="tab" data-tab="warehouses">🏭 Склады</button>
+    <button class="tab" data-tab="logs">📜 Логи</button>
+</nav>
+
+<!-- ===================== КОНТЕНТ ===================== -->
+<main class="content">
+
+    <!-- ============ ТАБ 1: ДАШБОРД ============ -->
+    <section class="tab-panel active" id="panel-dashboard">
+
+        <div class="status-cards">
+            <div class="status-card" id="card-server">
+                <div class="status-card-title">Сервер</div>
+                <div class="status-card-value" id="server-value">—</div>
+                <div class="status-card-sub" id="server-sub">—</div>
+            </div>
+            <div class="status-card" id="card-tts">
+                <div class="status-card-title">TTS Silero</div>
+                <div class="status-card-value" id="tts-value">—</div>
+                <div class="status-card-sub" id="tts-sub">—</div>
+            </div>
+            <div class="status-card" id="card-wh">
+                <div class="status-card-title">Менеджер складов</div>
+                <div class="status-card-value" id="wh-value">—</div>
+                <div class="status-card-sub" id="wh-sub">—</div>
+            </div>
+            <div class="status-card" id="card-db">
+                <div class="status-card-title">База данных</div>
+                <div class="status-card-value" id="db-value">—</div>
+                <div class="status-card-sub" id="db-sub">—</div>
+            </div>
+        </div>
+
+        <h2 class="section-title">
+            Активные вызовы
+            <span class="badge" id="calls-count">0</span>
+        </h2>
+
+        <div class="table-wrap">
+            <table class="data-table" id="calls-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>External ID</th>
+                        <th>Тип</th>
+                        <th>Имя</th>
+                        <th>Оборудование</th>
+                        <th>Ожидание</th>
+                        <th>Действие</th>
+                    </tr>
+                </thead>
+                <tbody id="calls-tbody">
+                    <tr><td colspan="7" class="empty">Загрузка…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- ============ ТАБ 2: СОЗДАТЬ ВЫЗОВ ============ -->
+    <section class="tab-panel" id="panel-create">
+        <h2 class="section-title">Создание вызова вручную</h2>
+        <p class="hint">Эмуляция поступления вызова от внешних систем (АСистем). Поля «Имя» и «Оборудование» сохраняются между созданиями — удобно для пакетной отправки однотипных вызовов.</p>
+
+        <div class="form" id="create-form">
+            <div class="form-row">
+                <label for="cf-external-id">External ID</label>
+                <input type="text" id="cf-external-id" placeholder="manual-<timestamp>">
+                <button class="btn btn-secondary btn-small" id="btn-regen-id" type="button" title="Сгенерировать новый ID">↻</button>
+            </div>
+
+            <div class="form-row">
+                <label for="cf-type">Тип вызова</label>
+                <select id="cf-type"></select>
+            </div>
+
+            <div class="form-row">
+                <label for="cf-name">Имя (ФИО)</label>
+                <input type="text" id="cf-name" placeholder="Иванов И.И.">
+            </div>
+
+            <div class="form-row">
+                <label for="cf-equipment">Оборудование / место</label>
+                <input type="text" id="cf-equipment" placeholder="Станок №5">
+            </div>
+
+            <div class="form-row">
+                <label for="cf-info">Дополнительная информация</label>
+                <input type="text" id="cf-info" placeholder="Комментарий (необязательно)">
+            </div>
+
+            <div class="form-row">
+                <label for="cf-forced">Автоматически закрыть через</label>
+                <div class="inline-group">
+                    <input type="number" id="cf-forced" min="0" step="1" value="0" style="width: 90px;">
+                    <span class="hint-inline">секунд (0 = не закрывать)</span>
+                </div>
+            </div>
+
+            <div class="form-actions">
+                <button class="btn btn-primary" id="btn-create-submit" type="button">✅ Создать вызов</button>
+                <div class="form-status" id="create-status"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============ ТАБ 3: ТИПЫ ============ -->
+    <section class="tab-panel" id="panel-types">
+        <h2 class="section-title">
+            Типы вызовов
+            <button class="btn btn-primary btn-small" id="btn-add-type" style="margin-left: auto;">➕ Добавить тип</button>
+        </h2>
+
+        <div class="table-wrap">
+            <table class="data-table" id="types-table">
+                <thead>
+                    <tr>
+                        <th>Ключ (type)</th>
+                        <th>Описание</th>
+                        <th>Life time, мин</th>
+                        <th>Повтор, мин</th>
+                        <th>Озвучивать</th>
+                        <th>Активных</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="types-tbody">
+                    <tr><td colspan="7" class="empty">Загрузка…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- ============ ТАБ 4: СКЛАДЫ ============ -->
+    <section class="tab-panel" id="panel-warehouses">
+        <h2 class="section-title">
+            Склады
+            <button class="btn btn-secondary btn-small" id="btn-force-check" style="margin-left: auto;">⚡ Форсировать проверку</button>
+        </h2>
+
+        <div class="table-wrap">
+            <table class="data-table" id="wh-table">
+                <thead>
+                    <tr>
+                        <th>Ключ</th>
+                        <th>Название</th>
+                        <th>Текущее</th>
+                        <th>Capacity</th>
+                        <th>Orange</th>
+                        <th>Red</th>
+                        <th>Повтор, мин</th>
+                        <th>Состояние</th>
+                        <th>Последний алерт</th>
+                        <th>Действие</th>
+                    </tr>
+                </thead>
+                <tbody id="wh-tbody">
+                    <tr><td colspan="9" class="empty">Загрузка…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- ============ ТАБ 5: ЛОГИ ============ -->
+    <section class="tab-panel" id="panel-logs">
+        <h2 class="section-title">
+            Логи
+            <div class="log-controls">
+                <label class="switch">
+                    <input type="checkbox" id="log-live">
+                    <span>Живой поток (2 сек)</span>
+                </label>
+                <button class="btn btn-secondary btn-small" id="btn-log-refresh">↻ Обновить</button>
+                <a class="btn btn-primary btn-small" id="btn-log-download" href="/admin/api/logs/download">⬇ Скачать лог</a>
+            </div>
+        </h2>
+
+        <div class="log-info">
+            <span id="log-path">—</span>
+            <span id="log-last-update"></span>
+        </div>
+
+        <pre class="log-view" id="log-view">Загрузка…</pre>
+    </section>
+
+</main>
+
+<!-- ===================== ТОСТЫ ===================== -->
+<div class="toast-container" id="toast-container"></div>
+
+<script src="/static/admin/admin.js"></script>
+</body>
+</html>
