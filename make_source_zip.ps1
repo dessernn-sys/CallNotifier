@@ -15,9 +15,12 @@ if (Test-Path $targetZip) {
     Remove-Item -Force $targetZip
 }
 
-$excludeDirs  = @('venv','venv_client','build','dist','__pycache__','.git','.idea',
-                  'audio_cache','client_cache','docs','.pytest_cache','.mypy_cache',
-                  '.ruff_cache','node_modules')
+$excludeDirs  = @('venv','venv_client','.venv','.venv_client','env','.env',
+                  'build','dist','__pycache__',
+                  '.git','.idea','.vscode','.vs',
+                  'audio_cache','client_cache',
+                  'docs','.pytest_cache','.mypy_cache','.ruff_cache',
+                  'node_modules','.tox','.eggs','.cache','.coverage')
 $excludeExts  = @('.log','.db','.bak','.pyc','.exe','.sha256','.tmp')
 $excludeFiles = @('config_admin.json','config_client.json','config_server.json',
                   '.env','secrets.json','make_source_zip.ps1')
