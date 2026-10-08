@@ -18,7 +18,7 @@ if "%VERSION%"=="" (
 REM --- Date in YYYY-MM-DD via PowerShell (locale-independent) ---
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set DATE=%%i
 
-set RELEASE_DIR=C:\Users\UserPC\Yandex.Disk\Для работы\Программирование\CallNotifier_Releases\v%VERSION%_%DATE%
+set RELEASE_DIR=C:\Dev\CallNotifier_Releases\v%VERSION%_%DATE%
 set EXE_NAME=CallNotifierClient-%VERSION%.exe
 set EXE_PATH=static\client\%EXE_NAME%
 
