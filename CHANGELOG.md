@@ -5,6 +5,48 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/),
 проект следует [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [1.2.0] - 2026-10-12
+
+### Добавлено
+- **Словарь произношений и ударений**:
+  - Таблица `pronunciation` в БД (`source`, `replacement`, `kind`).
+  - CRUD через админку (таб «🔤 Словарь TTS»).
+  - Автомиграция из старого хардкода (`LATIN_ABBR_DICT`, `STRESS_DICTIONARY`).
+  - Применяется мгновенно — TTS перечитывает словарь при изменении.
+  - Регистронезависимо для обоих типов (`replace`, `stress`).
+- **Шаблоны TTS** для новых вызовов и напоминаний:
+  - Таблица `tts_templates` в БД (`type`, `new_call_template`, `reminder_template`).
+  - Визуальный редактор в админке (таб «📝 Шаблоны TTS»).
+  - Плейсхолдеры: `{name}`, `{equipment}`, `{info}`, `{info_part}`, `{type}`, `{type_desc}`.
+  - Превью на лету с тестовыми данными.
+  - Кнопки быстрой вставки плейсхолдеров в активное поле.
+  - Кнопка «Сбросить к дефолтному».
+- **Выбор голоса Silero** (таб «🎙 Настройки TTS»):
+  - 5 голосов: `xenia`, `aidar`, `baya`, `kseniya`, `eugene`.
+  - Хранение в `config_server.json` (секция `tts.speaker`).
+  - Применяется мгновенно, переживает перезапуск сервера.
+- **Кнопка «Очистить кэш TTS»** — удаление всех WAV из `audio_cache/`.
+- **Дефолтные шаблоны TTS включают `{info_part}`** — комментарий озвучивается по умолчанию.
+
+### Исправлено
+- **Дублирование вызовов** в `/api/v1/sync` — в `_process_server_data` было два подряд `result_calls.append(call)`. Оставлен один.
+- **`render_template` — порядок подстановки**: `{info_part}` обрабатывается до `{info}`, чтобы не было конфликта.
+- **Чистка пунктуации в шаблонах**: убираются висячие запятые и пробелы перед знаками препинания (`re.sub`).
+
+### Изменено
+- **`config_server.json`**: добавлена секция `tts` (`{"speaker": "xenia"}`).
+- **`tts_service.py`**: `TTSService.__init__` принимает `config`, читает `tts.speaker`.
+- **`server.py`**: `TTSService(db=db, config=config)` — передаётся ссылка на конфиг.
+
+### Совместимость
+- **Python:** 3.11.9
+- **PyInstaller:** 6.22.3
+- **Сервер и клиент:** минорные версии в пределах `1.x.x` совместимы.
+- **Миграция:** словарь произношений и шаблоны TTS автоматически создаются при первом запуске сервера (таблицы + дефолтные значения).
+
+---
+
+
 ## [1.1.0] - 2026-10-07
 
 ### Добавлено
@@ -68,5 +110,6 @@
 - Автомиграция конфигов: `config.json` → `config_client.json` + `config_server.json`.
 - Разделение логов: `notifier_server.log` / `notifier_client.log`.
 
-[1.1.0]: https://example.com/compare/v1.0.0...v1.1.0
-[1.0.0]: https://example.com/releases/v1.0.0
+[1.2.0]: https://github.com/dessernn-sys/CallNotifier/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/dessernn-sys/CallNotifier/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/dessernn-sys/CallNotifier/releases/tag/v1.0.0

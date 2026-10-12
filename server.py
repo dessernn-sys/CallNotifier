@@ -59,7 +59,7 @@ def main():
     port = config.get("http_server", "port", default=5499)
 
     db = Database()
-    tts_service = TTSService()
+    tts_service = TTSService(db=db, config=config)
 
     # Менеджер складов
     warehouse_manager = WarehouseManager(db, config=config, tts_service=tts_service)

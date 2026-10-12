@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify, send_file, abort, Response
 from werkzeug.serving import make_server
 
 from database import Database
-from tts_service import TTSService
+from tts_service import TTSService, render_template, DEFAULT_NEW_CALL_TEMPLATE, DEFAULT_REMINDER_TEMPLATE
 from logger import setup_logger, LOG_FILE
 
 
@@ -54,10 +54,15 @@ class HTTPServerThread(threading.Thread):
         self.admin_config = admin_config
         self.started_at = time.time()
 
-        # Трекер последних напоминаний: {(client_id, external_id): unix_timestamp}
+        # Трекер последних напоминаний: {(client_id, key): unix_timestamp}
         # Хранится строго в памяти процесса. Каждый клиент имеет СВОЙ трекер,
         # чтобы напоминания озвучивались независимо на всех рабочих местах.
-        # Ключ — кортеж (client_id, external_id).
+        #
+        # Формат ключа:
+        #   * (client_id, "all_reminders") — общее напоминание на клиента (текущий формат).
+        #     Одно напоминание раз в N минут со ВСЕМИ активными вызовами.
+        #   * (client_id, external_id) — старый формат per-call. Может ещё
+        #     оставаться в памяти при горячем обновлении — очистится через час.
         self._last_reminder_sent: dict[tuple[str, str], float] = {}
         self._reminder_lock = threading.Lock()
 
@@ -151,23 +156,54 @@ class HTTPServerThread(threading.Thread):
             calls = self.db.get_open_calls(types_filter)
             warehouses = self.db.get_warehouses()
 
+            # Загружаем шаблоны TTS для всех типов (один запрос к БД)
+            templates = self.db.get_templates()
+            
+            # Кеш описаний типов (для {type_desc})
+            type_desc_map = {t['type']: t.get('description', '') or t['type']
+                             for t in self.db.get_all_types()}
+            
             result_calls = []
             reminders_due = {}
-            calls_by_type = {}
             now = time.time()
 
             # Множество external_id активных вызовов — для очистки трекера напоминаний
             active_external_ids = set()
 
-            for call in calls:
-                # ---------- Озвучка НОВОГО вызова (как раньше) ----------
-                tts_text = f"Внимание! Новый вызов! {call['name']}, пройдите к {call['equipment']}."
-                if self.tts_service and not self.tts_service.is_cached(tts_text):
-                    threading.Thread(target=self.tts_service.generate_chunk, args=(tts_text,), daemon=True).start()
+            # Кандидаты для ОБЩЕГО напоминания на клиента.
+            # Сюда попадают все вызовы, которые уже «пересели» свой repeat_sec
+            # (то есть по ним пора напоминать).
+            reminder_candidates = []
 
-                audio_filename = self.tts_service.get_filename(tts_text) if self.tts_service else None
-                audio_filepath = os.path.join(self.tts_service.cache_dir, audio_filename) if audio_filename else None
-                audio_size = os.path.getsize(audio_filepath) if audio_filepath and os.path.exists(audio_filepath) else 0
+            # Минимальный repeat_sec среди ВСЕХ активных вызовов (нужен для выбора
+            # интервала между напоминаниями клиенту).
+            min_repeat_sec = None
+
+            for call in calls:
+                # ---------- Озвучка НОВОГО вызова (с учётом шаблона типа) ----------
+                new_tpl = templates.get(call['type'], {}).get('new_call_template') or ""
+                # type_desc нужен для {type_desc} — берём из кеша типов
+                type_desc = type_desc_map.get(call['type'], "")
+
+                if new_tpl:
+                    tts_text = render_template(new_tpl, call, type_desc)
+                else:
+                    tts_text = render_template(DEFAULT_NEW_CALL_TEMPLATE, call, type_desc)
+
+                # Если шаблон дал пустую строку — не озвучиваем
+                if not tts_text.strip():
+                    audio_filename = None
+                    audio_size = 0
+                else:
+                    if self.tts_service and not self.tts_service.is_cached(tts_text):
+                        threading.Thread(
+                            target=self.tts_service.generate_chunk,
+                            args=(tts_text,), daemon=True
+                        ).start()
+
+                    audio_filename = self.tts_service.get_filename(tts_text) if self.tts_service else None
+                    audio_filepath = os.path.join(self.tts_service.cache_dir, audio_filename) if audio_filename else None
+                    audio_size = os.path.getsize(audio_filepath) if audio_filepath and os.path.exists(audio_filepath) else 0
 
                 call['audio_filename'] = audio_filename
                 call['audio_size'] = audio_size
@@ -175,42 +211,52 @@ class HTTPServerThread(threading.Thread):
 
                 active_external_ids.add(call['external_id'])
 
-                # ---------- Решение о НАПОМИНАНИИ (per-client) ----------
-                # 1) Сколько минут повтор для этого типа
+                # ---------- Проверяем: этот вызов может попасть в общее напоминание? ----------
                 type_cfg = self.db._conn.execute(
                     "SELECT repeat_interval_min FROM types WHERE type = ?", (call['type'],)
                 ).fetchone()
                 repeat_min = type_cfg['repeat_interval_min'] if type_cfg else 5
                 repeat_sec = max(60, repeat_min * 60)  # защита от нулевых интервалов
 
-                # 2) Прошло ли достаточно с момента старта вызова
+                if min_repeat_sec is None or repeat_sec < min_repeat_sec:
+                    min_repeat_sec = repeat_sec
+
                 elapsed_since_start = now - call['datetime_start']
                 if elapsed_since_start < repeat_sec:
-                    continue  # ещё рано напоминать, только «новый вызов» сыграли
+                    continue  # ещё рано — вызов появился недавно
 
-                # 3) Прошло ли достаточно с момента ПОСЛЕДНЕГО напоминания
-                #    ИМЕННО ЭТОМУ КЛИЕНТУ по этому вызову
-                tracker_key = (client_id, call['external_id'])
+                # Этот вызов готов к напоминанию — добавляем в общий список
+                reminder_candidates.append(call)
+
+            # ---------- Общее напоминание на клиента ----------
+            # Одно напоминание раз в N минут со ВСЕМИ активными вызовами.
+            # Это устраняет «эхо» и каскады: клиент всегда получает один файл.
+            if reminder_candidates and self.tts_service:
+                tracker_key = (client_id, "all_reminders")
                 last_sent = self._last_reminder_sent.get(tracker_key, 0.0)
-                if last_sent > 0 and (now - last_sent) < repeat_sec:
-                    continue  # этому клиенту напоминали недавно — молчим
 
-                # 4) Пора напоминать — добавляем в группу по типу
-                calls_by_type.setdefault(call['type'], []).append(call)
+                client_repeat_sec = max(60, min_repeat_sec or 300)
 
-                # 5) Помечаем «отправлено этому клиенту сейчас»
-                with self._reminder_lock:
-                    self._last_reminder_sent[tracker_key] = now
-
-            # ---------- Сборка напоминаний по группам типов ----------
-            if self.tts_service and calls_by_type:
-                for ctype, type_calls in calls_by_type.items():
+                if last_sent == 0.0 or (now - last_sent) >= client_repeat_sec:
+                    # Собираем одно напоминание из ВСЕХ кандидатов.
+                    # Заголовок оставляем жёстко, фразы — по шаблонам типов.
                     phrases = ["Напоминаю, список ожидания!"]
-                    for c in type_calls:
-                        phrases.append(f"{c['name']}, пройдите к {c['equipment']}.")
-                    reminder_file = self.tts_service.build_reminder_audio(phrases, pause_sec=0.5)
-                    if reminder_file:
-                        reminders_due[ctype] = reminder_file
+                    for c in reminder_candidates:
+                        tpl = templates.get(c['type'], {}).get('reminder_template') or ""
+                        if tpl:
+                            phrase = render_template(tpl, c, type_desc_map.get(c['type'], ""))
+                        else:
+                            phrase = render_template(DEFAULT_REMINDER_TEMPLATE, c, type_desc_map.get(c['type'], ""))
+                        # Пустые фразы пропускаем
+                        if phrase.strip():
+                            phrases.append(phrase)
+                    # Если после фильтра остался только заголовок — ничего не напоминаем
+                    if len(phrases) > 1:
+                        reminder_file = self.tts_service.build_reminder_audio(phrases, pause_sec=0.5)
+                        if reminder_file:
+                            reminders_due["all"] = reminder_file
+                            with self._reminder_lock:
+                                self._last_reminder_sent[tracker_key] = now
 
             # ---------- Очистка трекера ----------
             # Удаляем:
@@ -505,6 +551,195 @@ class HTTPServerThread(threading.Thread):
             return jsonify({"status": "ok"}), 200
 
         # ====================================================================
+        # Админка: API — Словарь произношений
+        # ====================================================================
+
+        @self.app.route('/admin/api/pronunciation', methods=['GET'])
+        @self._admin_required
+        def admin_get_pronunciation():
+            """Возвращает весь словарь произношений/ударений."""
+            try:
+                rows = self.db.get_pronunciations()
+            except Exception as e:
+                logger.error(f"Ошибка чтения словаря произношений: {e}")
+                return jsonify({"error": str(e)}), 500
+            return jsonify(rows), 200
+
+        @self.app.route('/admin/api/pronunciation', methods=['POST'])
+        @self._admin_required
+        def admin_upsert_pronunciation():
+            """Создаёт или обновляет запись словаря."""
+            data = request.get_json(silent=True) or {}
+            source = str(data.get("source", "")).strip()
+            replacement = str(data.get("replacement", "")).strip()
+            kind = str(data.get("kind", "replace")).strip().lower()
+
+            if not source or not replacement:
+                return jsonify({"error": "source и replacement обязательны"}), 400
+            if kind not in ("replace", "stress"):
+                return jsonify({"error": "kind должен быть 'replace' или 'stress'"}), 400
+
+            try:
+                ok = self.db.upsert_pronunciation(source, replacement, kind)
+            except Exception as e:
+                logger.error(f"Ошибка сохранения словаря: {e}")
+                return jsonify({"error": str(e)}), 500
+
+            if not ok:
+                return jsonify({"error": "Не удалось сохранить запись"}), 400
+
+            # Сбрасываем кэш в TTS, чтобы изменения применились мгновенно
+            if self.tts_service and hasattr(self.tts_service, '_refresh_pronunciation_cache'):
+                try:
+                    self.tts_service._refresh_pronunciation_cache()
+                except Exception as e:
+                    logger.warning(f"Не удалось обновить кэш словаря TTS: {e}")
+
+            return jsonify({"status": "ok", "source": source.lower()}), 200
+
+        @self.app.route('/admin/api/pronunciation/<path:source>', methods=['DELETE'])
+        @self._admin_required
+        def admin_delete_pronunciation(source):
+            """Удаляет запись словаря по source."""
+            try:
+                ok = self.db.delete_pronunciation(source)
+            except Exception as e:
+                logger.error(f"Ошибка удаления записи словаря: {e}")
+                return jsonify({"error": str(e)}), 500
+
+            if not ok:
+                return jsonify({"error": "Запись не найдена"}), 404
+
+            # Сбрасываем кэш TTS
+            if self.tts_service and hasattr(self.tts_service, '_refresh_pronunciation_cache'):
+                try:
+                    self.tts_service._refresh_pronunciation_cache()
+                except Exception as e:
+                    logger.warning(f"Не удалось обновить кэш словаря TTS: {e}")
+
+            return jsonify({"status": "ok"}), 200
+
+        # ====================================================================
+        # Админка: API — Шаблоны TTS
+        # ====================================================================
+
+        @self.app.route('/admin/api/templates', methods=['GET'])
+        @self._admin_required
+        def admin_get_templates():
+            """Возвращает шаблоны + описания типов (для UI)."""
+            try:
+                templates = self.db.get_templates()
+                types = self.db.get_all_types()
+            except Exception as e:
+                logger.error(f"Ошибка чтения шаблонов: {e}")
+                return jsonify({"error": str(e)}), 500
+
+            # Собираем единый список: для каждого типа — его шаблоны
+            result = []
+            for t in types:
+                type_key = t['type']
+                tpl = templates.get(type_key, {})
+                result.append({
+                    "type": type_key,
+                    "description": t.get('description', ''),
+                    "new_call_template": tpl.get('new_call_template', ''),
+                    "reminder_template": tpl.get('reminder_template', ''),
+                })
+            return jsonify(result), 200
+
+        @self.app.route('/admin/api/templates/<type_key>', methods=['POST'])
+        @self._admin_required
+        def admin_upsert_template(type_key):
+            """Сохраняет шаблоны для одного типа."""
+            data = request.get_json(silent=True) or {}
+            new_call_template = str(data.get("new_call_template", ""))
+            reminder_template = str(data.get("reminder_template", ""))
+
+            try:
+                ok = self.db.upsert_template(
+                    type_key=type_key,
+                    new_call_template=new_call_template,
+                    reminder_template=reminder_template,
+                )
+            except Exception as e:
+                logger.error(f"Ошибка сохранения шаблона {type_key}: {e}")
+                return jsonify({"error": str(e)}), 500
+
+            if not ok:
+                return jsonify({"error": "Тип не найден"}), 404
+
+            logger.info(f"Админ сохранил шаблон TTS для {type_key}")
+            return jsonify({"status": "ok", "type": type_key}), 200
+
+        @self.app.route('/admin/api/templates/preview', methods=['POST'])
+        @self._admin_required
+        def admin_preview_template():
+            """Возвращает превью отрендеренного шаблона с тестовыми данными.
+
+            Принимает JSON: {template, type, type_desc}.
+            """
+            data = request.get_json(silent=True) or {}
+            template = str(data.get("template", ""))
+            type_key = str(data.get("type", ""))
+            type_desc = str(data.get("type_desc", ""))
+
+            # Тестовые данные для превью
+            test_call = {
+                "name": "Иванов Иван",
+                "equipment": "XL-75",
+                "info": "Подпись тиража",
+                "type": type_key,
+            }
+            result = render_template(template or "", test_call, type_desc)
+            return jsonify({"preview": result}), 200
+
+        # ====================================================================
+        # Админка: API — Настройки TTS (голос, кэш)
+        # ====================================================================
+
+        @self.app.route('/admin/api/tts/speaker', methods=['GET'])
+        @self._admin_required
+        def admin_get_speaker():
+            """Возвращает текущий голос и список доступных."""
+            if not self.tts_service:
+                return jsonify({"error": "TTS недоступен"}), 500
+            current = self.tts_service.get_speaker()
+            available = list(getattr(self.tts_service, 'AVAILABLE_SPEAKERS', []))
+            return jsonify({
+                "current": current,
+                "available": available,
+            }), 200
+
+        @self.app.route('/admin/api/tts/speaker', methods=['POST'])
+        @self._admin_required
+        def admin_set_speaker():
+            """Меняет голос TTS. Не сбрасывает кэш — это делается отдельным вызовом."""
+            if not self.tts_service:
+                return jsonify({"error": "TTS недоступен"}), 500
+            data = request.get_json(silent=True) or {}
+            speaker = str(data.get("speaker", "")).strip().lower()
+
+            ok = self.tts_service.set_speaker(speaker)
+            if not ok:
+                return jsonify({
+                    "error": f"Недопустимый голос. Доступные: {', '.join(getattr(self.tts_service, 'AVAILABLE_SPEAKERS', []))}"
+                }), 400
+
+            logger.info(f"Админ переключил голос TTS на: {speaker}")
+            return jsonify({"status": "ok", "speaker": speaker}), 200
+
+        @self.app.route('/admin/api/tts/cache/clear', methods=['POST'])
+        @self._admin_required
+        def admin_clear_tts_cache():
+            """Очищает кэш TTS (удаляет все WAV-файлы)."""
+            if not self.tts_service:
+                return jsonify({"error": "TTS недоступен"}), 500
+
+            removed = self.tts_service.clear_cache()
+            logger.info(f"Админ очистил кэш TTS: удалено {removed} файлов")
+            return jsonify({"status": "ok", "removed": removed}), 200
+
+        # ====================================================================
         # Админка: API — Логи
         # ====================================================================
 
@@ -594,17 +829,29 @@ class HTTPServerThread(threading.Thread):
     def _cleanup_reminder_tracker(self, active_external_ids: set, now: float):
         """Очищает трекер напоминаний от устаревших записей.
 
-        Удаляются записи:
-          * по вызовам, которых больше нет в active_external_ids (вызов закрыт);
-          * старше 1 часа — клиент, вероятно, отключился и больше не вернётся
-            (за час он бы точно синхронизировался).
+        Два типа ключей:
+          * (client_id, "all_reminders") — новый формат (общее напоминание).
+            Не привязан к конкретному вызову, удаляется только по времени.
+          * (client_id, external_id) — старый формат (per-call).
+            Может ещё оставаться в памяти после горячего обновления.
+            Удаляется, если вызов закрыт или запись старше часа.
+
+        Общее правило: записи старше часа удаляются всегда — клиент,
+        вероятно, отключился и больше не вернётся (за час он бы 100%
+        синхронизировался и обновил бы свой трекер).
         """
         ONE_HOUR = 3600.0
         with self._reminder_lock:
-            stale_keys = [
-                key for key, ts in self._last_reminder_sent.items()
-                if key[1] not in active_external_ids or (now - ts) > ONE_HOUR
-            ]
+            stale_keys = []
+            for key, ts in self._last_reminder_sent.items():
+                _, second = key
+                # Проверка по времени — общая для обоих форматов
+                if (now - ts) > ONE_HOUR:
+                    stale_keys.append(key)
+                    continue
+                # Для старого формата дополнительно проверяем, что вызов ещё активен
+                if second != "all_reminders" and second not in active_external_ids:
+                    stale_keys.append(key)
             for key in stale_keys:
                 self._last_reminder_sent.pop(key, None)
 

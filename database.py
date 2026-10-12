@@ -66,8 +66,38 @@ class Database:
                     updated_at REAL
                 )
             """)
+
+            # Словарь произношений и ударений для TTS.
+            # source — что ищем в тексте (регистр игнорируется).
+            # replacement — на что заменяем.
+            # kind: 'replace' (замена, латиница → кириллица) или
+            #       'stress'  (расстановка ударений через +).
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS pronunciation (
+                    source TEXT PRIMARY KEY,
+                    replacement TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'replace',
+                    created_at REAL DEFAULT (strftime('%s', 'now'))
+                )
+            """)
+
+            # Шаблоны TTS для озвучки вызовов.
+            # Для каждого типа вызова можно задать свой текст для:
+            #   * new_call_template — озвучка нового вызова;
+            #   * reminder_template — озвучка напоминания.
+            # Пустой шаблон = использовать дефолтный из tts_service.py.
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS tts_templates (
+                    type TEXT PRIMARY KEY,
+                    new_call_template TEXT DEFAULT '',
+                    reminder_template TEXT DEFAULT '',
+                    updated_at REAL DEFAULT (strftime('%s', 'now'))
+                )
+            """)
             self._conn.commit()
             self._init_default_types()
+            self._init_default_pronunciation()
+            self._init_default_templates()
 
     def _init_default_types(self):
         with self._lock:
@@ -92,7 +122,66 @@ class Database:
                     """, t)
                 self._conn.commit()
                 logger.info(f"Добавлено {len(default_types)} стандартных типов вызовов")
+                
+    def _init_default_pronunciation(self):
+        """Заполняет словарь произношений значениями из старого хардкода,
+        если таблица пуста (первый запуск после обновления).
+        """
+        with self._lock:
+            count = self._conn.execute("SELECT COUNT(*) FROM pronunciation").fetchone()[0]
+            if count > 0:
+                return
 
+            # Миграция из старого LATIN_ABBR_DICT и STRESS_DICTIONARY.
+            # Ключи в БД нормализуем в нижний регистр — сравнение в TTS
+            # будет через re.IGNORECASE, так что регистр в БД не важен,
+            # но для единообразия храним в lower.
+            defaults = [
+                # --- Замены (латиница, аббревиатуры) ---
+                ("xl",     "ИксЭль",   "replace"),
+                ("id",     "АйДи",     "replace"),
+                ("pc",     "ПэКа",     "replace"),
+                ("bobst",  "Бобст",    "replace"),
+                # --- Ударения (кириллица) ---
+                ("иванов",     "ива+нов",     "stress"),
+                ("петров",     "петро+в",     "stress"),
+                ("сидоров",    "си+доров",    "stress"),
+                ("звонит",     "зво+нит",     "stress"),
+                ("кладовщик",  "кла+довщик",  "stress"),
+                ("каталог",    "катало+г",    "stress"),
+                ("документ",   "докуме+нт",   "stress"),
+                ("станок",     "стано+к",     "stress"),
+                ("станки",     "станки+",     "stress"),
+                ("паллет",     "палле+т",     "stress"),
+                ("отгрузка",   "отгру+зка",   "stress"),
+                ("погрузка",   "погру+зка",   "stress"),
+                ("разгрузка",  "разгру+зка",  "stress"),
+            ]
+            for source, replacement, kind in defaults:
+                self._conn.execute("""
+                    INSERT OR IGNORE INTO pronunciation (source, replacement, kind)
+                    VALUES (?, ?, ?)
+                """, (source, replacement, kind))
+            self._conn.commit()
+            logger.info(f"Добавлено {len(defaults)} записей словаря произношений (миграция из хардкода)")
+
+    def _init_default_templates(self):
+        """Создаёт пустые шаблоны для всех существующих типов вызовов.
+
+        Пустой шаблон = использовать дефолтный (зашитый в tts_service.py).
+        Админ может потом заполнить любой из них через веб-интерфейс.
+        """
+        with self._lock:
+            # Создаём пустые записи для всех типов, у которых ещё нет шаблона
+            self._conn.execute("""
+                INSERT OR IGNORE INTO tts_templates (type, new_call_template, reminder_template)
+                SELECT type, '', '' FROM types
+            """)
+            self._conn.commit()
+            # Считаем, сколько всего шаблонов
+            total = self._conn.execute("SELECT COUNT(*) FROM tts_templates").fetchone()[0]
+            logger.info(f"Шаблонов TTS в БД: {total}")
+            
     def register_recent_stop(self, external_id: str):
         """Запоминаем, что по этому ID недавно был stop."""
         now = time.time()
@@ -290,6 +379,121 @@ class Database:
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    # ========================================================================
+    # Словарь произношений (TTS)
+    # ========================================================================
+
+    def get_pronunciations(self) -> list:
+        """Возвращает все записи словаря произношений."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT source, replacement, kind, created_at FROM pronunciation ORDER BY kind, source"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def upsert_pronunciation(self, source: str, replacement: str, kind: str = 'replace') -> bool:
+        """Создаёт или обновляет запись словаря.
+
+        source/replacement обрезаются; source приводится к нижнему регистру
+        (сравнение в TTS идёт через re.IGNORECASE).
+        kind должен быть 'replace' или 'stress'.
+        """
+        source = (source or '').strip().lower()
+        replacement = (replacement or '').strip()
+        if not source or not replacement:
+            return False
+        if kind not in ('replace', 'stress'):
+            return False
+
+        with self._lock:
+            self._conn.execute("""
+                INSERT INTO pronunciation (source, replacement, kind)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                    replacement = excluded.replacement,
+                    kind = excluded.kind
+            """, (source, replacement, kind))
+            self._conn.commit()
+        logger.info(f"Словарь произношений сохранён: {source} → {replacement} ({kind})")
+        return True
+
+    def delete_pronunciation(self, source: str) -> bool:
+        """Удаляет запись словаря по source. Возвращает True, если что-то удалилось."""
+        source = (source or '').strip().lower()
+        if not source:
+            return False
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM pronunciation WHERE source = ?", (source,))
+            self._conn.commit()
+            deleted = cur.rowcount > 0
+        if deleted:
+            logger.info(f"Словарь произношений удалён: {source}")
+        return deleted
+
+    # ========================================================================
+    # Шаблоны TTS
+    # ========================================================================
+
+    def get_templates(self) -> dict:
+        """Возвращает ВСЕ шаблоны в виде словаря {type: {new_call_template, reminder_template}}.
+
+        Формат возврата — словарь для быстрого доступа по типу в sync-цикле.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT type, new_call_template, reminder_template FROM tts_templates"
+            ).fetchall()
+            return {
+                row["type"]: {
+                    "new_call_template": row["new_call_template"] or "",
+                    "reminder_template": row["reminder_template"] or "",
+                }
+                for row in rows
+            }
+
+    def get_template(self, type_key: str) -> dict:
+        """Возвращает шаблоны для одного типа."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT type, new_call_template, reminder_template FROM tts_templates WHERE type = ?",
+                (type_key,)
+            ).fetchone()
+            if not row:
+                return {"type": type_key, "new_call_template": "", "reminder_template": ""}
+            return {
+                "type": row["type"],
+                "new_call_template": row["new_call_template"] or "",
+                "reminder_template": row["reminder_template"] or "",
+            }
+
+    def upsert_template(self, type_key: str,
+                        new_call_template: str = "",
+                        reminder_template: str = "") -> bool:
+        """Создаёт или обновляет шаблоны для типа."""
+        type_key = (type_key or "").strip()
+        if not type_key:
+            return False
+
+        # Гарантируем, что тип существует — это защита от создания «висячих» шаблонов
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM types WHERE type = ?", (type_key,)
+            ).fetchone()
+            if not exists:
+                return False
+
+            self._conn.execute("""
+                INSERT INTO tts_templates (type, new_call_template, reminder_template, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(type) DO UPDATE SET
+                    new_call_template = excluded.new_call_template,
+                    reminder_template = excluded.reminder_template,
+                    updated_at = excluded.updated_at
+            """, (type_key, new_call_template or "", reminder_template or "", time.time()))
+            self._conn.commit()
+        logger.info(f"Шаблон TTS сохранён для типа: {type_key}")
+        return True
 
     def close(self):
         if self._conn:

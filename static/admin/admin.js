@@ -4,6 +4,9 @@
 
 'use strict';
 
+// Служебные типы для словаря (не отображаются)
+// (это не пригодится здесь, но оставим для памяти)
+
 // ============================================================================
 // Утилиты
 // ============================================================================
@@ -121,6 +124,10 @@ function switchTab(name) {
     if (name === 'types')       refreshTypes();
     if (name === 'warehouses')  refreshWarehouses();
     if (name === 'logs')        refreshLogs();
+	if (name === 'pronunciation') refreshPronunciation();
+    if (name === 'templates')   refreshTemplates();
+	if (name === 'tts')   refreshTtsSettings();
+
 }
 
 // ============================================================================
@@ -600,6 +607,116 @@ logLive.addEventListener('change', () => {
 });
 
 // ============================================================================
+// ТАБ 6: СЛОВАРЬ ПРОИЗНОШЕНИЙ
+// ============================================================================
+
+async function refreshPronunciation() {
+    const tbody = document.getElementById('pron-tbody');
+    try {
+        const data = await apiFetch('/admin/api/pronunciation');
+        renderPronunciation(data);
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="4" class="empty">Ошибка: ${esc(e.message)}</td></tr>`;
+    }
+}
+
+function renderPronunciation(items) {
+    const tbody = document.getElementById('pron-tbody');
+    if (!items.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Словарь пуст</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = items.map(item => {
+        const kindLabel = item.kind === 'stress' ? 'Ударение' : 'Замена';
+        const kindClass = item.kind === 'stress' ? 'row-orange' : 'row-green';
+        return `
+            <tr class="${kindClass}" data-source="${esc(item.source)}">
+                <td><code>${esc(item.source)}</code></td>
+                <td><input class="cell-input" data-field="replacement" value="${esc(item.replacement)}" style="width: 100%;"></td>
+                <td>
+                    <select class="cell-input" data-field="kind" style="width: 100%;">
+                        <option value="replace" ${item.kind === 'replace' ? 'selected' : ''}>Замена</option>
+                        <option value="stress" ${item.kind === 'stress' ? 'selected' : ''}>Ударение</option>
+                    </select>
+                </td>
+                <td>
+                    <button class="btn btn-primary btn-mini" data-save-pron="${esc(item.source)}">💾</button>
+                    <button class="btn btn-danger btn-mini" data-del-pron="${esc(item.source)}">🗑</button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+
+    // Кнопки "Сохранить"
+    tbody.querySelectorAll('[data-save-pron]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const source = btn.dataset.savePron;
+            const row = tbody.querySelector(`tr[data-source="${CSS.escape(source)}"]`);
+            const payload = {
+                source: source,
+                replacement: row.querySelector('[data-field="replacement"]').value.trim(),
+                kind: row.querySelector('[data-field="kind"]').value,
+            };
+            if (!payload.replacement) {
+                toast('Ошибка', 'Замена не может быть пустой', 'error', 3000);
+                return;
+            }
+            try {
+                await apiFetch('/admin/api/pronunciation', {
+                    method: 'POST',
+                    body: JSON.stringify(payload),
+                });
+                toast('Сохранено', `${source} → ${payload.replacement}`, 'success', 2000);
+                refreshPronunciation();
+            } catch (e) {
+                toast('Ошибка', e.message, 'error', 4000);
+            }
+        });
+    });
+
+    // Кнопки "Удалить"
+    tbody.querySelectorAll('[data-del-pron]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const source = btn.dataset.delPron;
+            if (!confirm(`Удалить запись "${source}"?`)) return;
+            try {
+                await apiFetch(`/admin/api/pronunciation/${encodeURIComponent(source)}`, {
+                    method: 'DELETE',
+                });
+                toast('Удалено', source, 'success', 2000);
+                refreshPronunciation();
+            } catch (e) {
+                toast('Ошибка', e.message, 'error', 4000);
+            }
+        });
+    });
+}
+
+document.getElementById('btn-add-pron').addEventListener('click', async () => {
+    const source = prompt('Что искать (source):');
+    if (!source) return;
+    const replacement = prompt('Чем заменить (replacement):');
+    if (!replacement) return;
+    const kindRaw = prompt('Тип: "replace" (замена) или "stress" (ударение):', 'replace');
+    const kind = (kindRaw || 'replace').toLowerCase();
+    if (kind !== 'replace' && kind !== 'stress') {
+        toast('Ошибка', 'Тип должен быть "replace" или "stress"', 'error', 3000);
+        return;
+    }
+    try {
+        await apiFetch('/admin/api/pronunciation', {
+            method: 'POST',
+            body: JSON.stringify({ source: source.trim(), replacement: replacement.trim(), kind }),
+        });
+        toast('Добавлено', `${source} → ${replacement}`, 'success', 2000);
+        refreshPronunciation();
+    } catch (e) {
+        toast('Ошибка', e.message, 'error', 4000);
+    }
+});
+
+// ============================================================================
 // Кнопка "Обновить" в хедере — обновляет активный таб
 // ============================================================================
 
@@ -615,6 +732,243 @@ document.getElementById('btn-refresh').addEventListener('click', () => {
 setInterval(() => {
     if (activeTab === 'dashboard') refreshDashboard();
 }, 5000);
+
+// ============================================================================
+// ТАБ 4: ШАБЛОНЫ TTS
+// ============================================================================
+
+const DEFAULT_NEW_CALL_TEMPLATE = "Внимание! Новый вызов! {name}, пройдите к {equipment}{info_part}.";
+const DEFAULT_REMINDER_TEMPLATE = "{name}, пройдите к {equipment}{info_part}.";
+
+let templatesCache = [];      // массив {type, description, new_call_template, reminder_template}
+let templatesLoaded = false;  // была ли загрузка из API
+let templatesActiveField = null;  // текущее активное textarea для вставки плейсхолдеров
+
+const tplType          = document.getElementById('tpl-type');
+const tplNew           = document.getElementById('tpl-new');
+const tplReminder      = document.getElementById('tpl-reminder');
+const tplPreviewNew    = document.getElementById('tpl-preview-new');
+const tplPreviewRem    = document.getElementById('tpl-preview-reminder');
+const tplStatus        = document.getElementById('tpl-status');
+
+
+async function refreshTemplates() {
+    try {
+        templatesCache = await apiFetch('/admin/api/templates');
+        templatesLoaded = true;
+
+        // Заполняем dropdown
+        const current = tplType.value;
+        tplType.innerHTML = templatesCache.map(t =>
+            `<option value="${esc(t.type)}">${esc(t.description || t.type)} (${esc(t.type)})</option>`
+        ).join('');
+
+        // Восстанавливаем выбранный тип (если был)
+        if (current && templatesCache.some(t => t.type === current)) {
+            tplType.value = current;
+        }
+
+        // Загружаем первый тип (или сохранённый)
+        loadSelectedTemplate();
+    } catch (e) {
+        tplStatus.textContent = `Ошибка: ${e.message}`;
+        tplStatus.className = 'form-status error';
+    }
+}
+
+function loadSelectedTemplate() {
+    const type = tplType.value;
+    const t = templatesCache.find(x => x.type === type);
+    if (!t) return;
+
+    tplNew.value = t.new_call_template || '';
+    tplReminder.value = t.reminder_template || '';
+    tplStatus.textContent = '';
+    tplStatus.className = 'form-status';
+
+    updateTplPreviews();
+}
+
+function updateTplPreviews() {
+    const type = tplType.value;
+    const t = templatesCache.find(x => x.type === type);
+    const typeDesc = t ? (t.description || type) : type;
+
+    // Локальная подстановка (без обращения к серверу, чтобы не гонять трафик)
+    const testCall = { name: 'Иванов Иван', equipment: 'XL-75', info: 'Подпись тиража', type: type };
+
+    const newTpl = tplNew.value.trim() || DEFAULT_NEW_CALL_TEMPLATE;
+    const remTpl = tplReminder.value.trim() || DEFAULT_REMINDER_TEMPLATE;
+
+    tplPreviewNew.textContent = '«' + renderLocal(newTpl, testCall, typeDesc) + '»';
+    tplPreviewRem.textContent = '«' + renderLocal(remTpl, testCall, typeDesc) + '»';
+}
+
+function renderLocal(template, call, typeDesc) {
+    let infoPart = call.info ? `, причина: ${call.info}` : '';
+    let result = template
+        .replace(/\{name\}/g, call.name || '')
+        .replace(/\{equipment\}/g, call.equipment || '')
+        .replace(/\{info_part\}/g, infoPart)
+        .replace(/\{info\}/g, call.info || '')
+        .replace(/\{type_desc\}/g, typeDesc || '')
+        .replace(/\{type\}/g, call.type || '');
+    // Чистка пробелов и запятых (как на сервере)
+    result = result.replace(/\s+/g, ' ');
+    result = result.replace(/\s+([.,!?;:])/g, '$1');
+    result = result.replace(/,\s*,/g, ',');
+    result = result.replace(/,\s*\./g, '.');
+    result = result.replace(/\s*,\s*$/, '');
+    return result.trim();
+}
+
+// Переключение типа
+tplType.addEventListener('change', loadSelectedTemplate);
+
+// Живое превью при вводе (с небольшой задержкой)
+let tplPreviewTimer = null;
+function scheduleTplPreview() {
+    clearTimeout(tplPreviewTimer);
+    tplPreviewTimer = setTimeout(updateTplPreviews, 200);
+}
+tplNew.addEventListener('input', scheduleTplPreview);
+tplReminder.addEventListener('input', scheduleTplPreview);
+
+// Запоминаем, куда вставлять плейсхолдеры
+tplNew.addEventListener('focus', () => { templatesActiveField = tplNew; });
+tplReminder.addEventListener('focus', () => { templatesActiveField = tplReminder; });
+
+// Кнопки плейсхолдеров
+document.querySelectorAll('#panel-templates [data-ph]').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const ph = btn.dataset.ph;
+        const field = templatesActiveField || tplNew;  // по умолчанию — новое
+        const start = field.selectionStart ?? field.value.length;
+        const end = field.selectionEnd ?? field.value.length;
+        const before = field.value.substring(0, start);
+        const after = field.value.substring(end);
+        field.value = before + ph + after;
+        // Ставим курсор после вставленного плейсхолдера
+        field.focus();
+        const pos = start + ph.length;
+        field.setSelectionRange(pos, pos);
+        updateTplPreviews();
+    });
+});
+
+// Сохранить
+document.getElementById('btn-save-tpl').addEventListener('click', async () => {
+    const type = tplType.value;
+    if (!type) return;
+    const payload = {
+        new_call_template: tplNew.value,
+        reminder_template: tplReminder.value,
+    };
+    const btn = document.getElementById('btn-save-tpl');
+    btn.disabled = true;
+    try {
+        await apiFetch(`/admin/api/templates/${encodeURIComponent(type)}`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+        });
+        tplStatus.textContent = '✅ Сохранено';
+        tplStatus.className = 'form-status success';
+        toast('Шаблон сохранён', type, 'success', 2000);
+        // Обновляем локальный кэш
+        const t = templatesCache.find(x => x.type === type);
+        if (t) {
+            t.new_call_template = payload.new_call_template;
+            t.reminder_template = payload.reminder_template;
+        }
+    } catch (e) {
+        tplStatus.textContent = `❌ ${e.message}`;
+        tplStatus.className = 'form-status error';
+        toast('Ошибка', e.message, 'error', 4000);
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+// Сбросить к дефолтному
+document.getElementById('btn-reset-tpl').addEventListener('click', () => {
+    if (!confirm('Сбросить оба шаблона к стандартным? Изменения не сохранятся, пока вы не нажмёте «Сохранить».')) return;
+    tplNew.value = '';
+    tplReminder.value = '';
+    updateTplPreviews();
+    tplStatus.textContent = '↺ Шаблоны сброшены к дефолтным (нажмите «Сохранить», чтобы применить)';
+    tplStatus.className = 'form-status';
+});
+
+// ============================================================================
+// ТАБ 7: НАСТРОЙКИ TTS
+// ============================================================================
+
+const ttsSpeaker = document.getElementById('tts-speaker');
+const ttsCurrent = document.getElementById('tts-current');
+const ttsStatus  = document.getElementById('tts-status');
+
+async function refreshTtsSettings() {
+    try {
+        const data = await apiFetch('/admin/api/tts/speaker');
+        ttsCurrent.textContent = data.current || '—';
+
+        // Заполняем dropdown
+        const current = data.current;
+        ttsSpeaker.innerHTML = (data.available || []).map(sp =>
+            `<option value="${esc(sp)}" ${sp === current ? 'selected' : ''}>${esc(sp)}</option>`
+        ).join('');
+    } catch (e) {
+        ttsStatus.textContent = `Ошибка: ${e.message}`;
+        ttsStatus.className = 'form-status error';
+    }
+}
+
+document.getElementById('btn-save-speaker').addEventListener('click', async () => {
+    const speaker = ttsSpeaker.value;
+    if (!speaker) return;
+
+    const btn = document.getElementById('btn-save-speaker');
+    btn.disabled = true;
+    try {
+        await apiFetch('/admin/api/tts/speaker', {
+            method: 'POST',
+            body: JSON.stringify({ speaker }),
+        });
+        ttsStatus.textContent = `✅ Голос изменён на ${speaker}`;
+        ttsStatus.className = 'form-status success';
+        toast('Голос изменён', speaker, 'success', 2000);
+        refreshTtsSettings();
+    } catch (e) {
+        ttsStatus.textContent = `❌ ${e.message}`;
+        ttsStatus.className = 'form-status error';
+        toast('Ошибка', e.message, 'error', 4000);
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+document.getElementById('btn-clear-tts-cache').addEventListener('click', async () => {
+    if (!confirm('Удалить все WAV-файлы из кэша TTS?\n\nВсе вызовы и напоминания будут перегенерированы при следующем обращении к ним.\n\nПродолжить?')) {
+        return;
+    }
+
+    const btn = document.getElementById('btn-clear-tts-cache');
+    btn.disabled = true;
+    try {
+        const result = await apiFetch('/admin/api/tts/cache/clear', {
+            method: 'POST',
+        });
+        ttsStatus.textContent = `✅ Удалено файлов: ${result.removed || 0}`;
+        ttsStatus.className = 'form-status success';
+        toast('Кэш очищен', `Удалено: ${result.removed || 0}`, 'success', 3000);
+    } catch (e) {
+        ttsStatus.textContent = `❌ ${e.message}`;
+        ttsStatus.className = 'form-status error';
+        toast('Ошибка', e.message, 'error', 4000);
+    } finally {
+        btn.disabled = false;
+    }
+});
 
 // ============================================================================
 // Инициализация при загрузке

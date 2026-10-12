@@ -8,7 +8,7 @@ from logger import setup_logger
 # Версия приложения
 # ============================================================================
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 logger = setup_logger('config')
 
@@ -120,6 +120,9 @@ DEFAULT_SERVER_CONFIG = {
     "warehouse": {
         "enabled": True,
         "warehouses": []
+    },
+    "tts": {
+        "speaker": "xenia"
     }
 }
 
