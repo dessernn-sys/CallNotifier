@@ -374,6 +374,12 @@ class AudioManager:
             if filename:
                 self._play_queue.put(os.path.join(self.tts_service.cache_dir, filename))
                 logger.info("Складское оповещение поставлено в очередь")
+                
+    def has_active_calls(self) -> bool:
+        """Возвращает True, если сейчас есть активные вызовы.
+        Нужно для headless-обновления (ждать пустого sync).
+        """
+        return bool(self._current_calls)
 
     def shutdown(self):
         self._stop_sync.set()

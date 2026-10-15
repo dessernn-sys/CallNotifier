@@ -82,6 +82,46 @@ class SettingsDialog:
         self.ttl_label = ttk.Label(frame, textvariable=self.ttl_label_var)
         self.ttl_label.grid(row=2, column=2, padx=5, pady=10, sticky="w")
 
+        # Секция автообновления
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=(16, 8)
+        )
+
+        ttk.Label(
+            frame, text="Автообновление", font=("Arial", 10, "bold")
+        ).grid(row=4, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+
+        # Чекбокс «Разрешить автообновление»
+        self.auto_update_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame,
+            text="Разрешить автообновление клиента",
+            variable=self.auto_update_var,
+        ).grid(row=5, column=0, columnspan=3, padx=10, pady=4, sticky="w")
+
+        # Чекбокс «Автономная работа»
+        self.headless_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Автономная работа (без диалогов, тихое обновление)",
+            variable=self.headless_var,
+        ).grid(row=6, column=0, columnspan=3, padx=10, pady=4, sticky="w")
+
+        ttk.Label(
+            frame,
+            text="При «Автономной работе» клиент обновляется молча, "
+                 "без диалога подтверждения.",
+            foreground="gray",
+        ).grid(row=7, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+
+        # Версия клиента (для диагностики)
+        from config import __version__ as _ver
+        ttk.Label(
+            frame,
+            text=f"Версия клиента: v{_ver}",
+            foreground="#4ec9b0",
+        ).grid(row=8, column=0, columnspan=3, padx=10, pady=(8, 4), sticky="w")
+
         frame.columnconfigure(1, weight=1)
 
 
@@ -213,6 +253,14 @@ class SettingsDialog:
         self.ttl_var.set(current_ttl)
         self._update_ttl_label()
 
+        # Автообновление
+        try:
+            self.auto_update_var.set(bool(self.config.get("update", "enabled", default=True)))
+            self.headless_var.set(bool(self.config.get("update", "headless_mode", default=False)))
+        except Exception:
+            self.auto_update_var.set(True)
+            self.headless_var.set(False)
+
     def _save_and_close(self):
         old_host = self.config.get("http_server", "host")
         old_port = self.config.get("http_server", "port")
@@ -224,6 +272,13 @@ class SettingsDialog:
         self.config.set(new_host, "http_server", "host")
         self.config.set(new_port, "http_server", "port")
         self.config.set(new_ttl, "display", "cache_ttl_days")
+
+        # Автообновление
+        try:
+            self.config.set(bool(self.auto_update_var.get()), "update", "enabled")
+            self.config.set(bool(self.headless_var.get()), "update", "headless_mode")
+        except Exception as e:
+            logger.warning(f"Не удалось сохранить настройки автообновления: {e}")
 
         # Собираем только те ключи типов, напротив которых стоит галочка True
         selected_types = [t_key for t_key, var in self.type_variables.items() if var.get()]
