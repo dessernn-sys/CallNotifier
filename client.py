@@ -75,12 +75,35 @@ def main():
     )
     app.app = app
 
+    # --- Автообновление клиента ---
+    try:
+        from config import __version__ as _current_version
+        from client_updater import ClientUpdater
+
+        updater = ClientUpdater(
+            config=config,
+            server_url=server_url,
+            current_version=_current_version,
+            version_callback=app.on_update_available,      # см. патч 4
+            state_callback=app.on_update_state,            # см. патч 4
+        )
+        app.updater = updater
+        updater.start()
+    except Exception as e:
+        logger.error(f"Не удалось запустить автообновление: {e}")
+        app.updater = None
+
     try:
         root.mainloop()
     except Exception as e:
         logger.error(f"Ошибка в главном цикле интерфейса: {e}")
     finally:
         logger.info("Завершение работы клиентского приложения...")
+        if 'app' in locals() and app and getattr(app, 'updater', None):
+            try:
+                app.updater.stop()
+            except Exception:
+                pass
         if 'audio' in locals() and audio:
             try:
                 audio.shutdown()

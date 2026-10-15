@@ -1,5 +1,7 @@
 import tkinter as tk
+from tkinter import ttk
 import time
+import threading
 from datetime import datetime
 import os
 import math
@@ -314,6 +316,212 @@ class FullScreenApp:
 
         # Запомним URL — пригодится, если сделаем клик
         self._latest_download_url = download_url
+
+    # ========================================================================
+    # Автообновление клиента
+    # ========================================================================
+
+    def on_update_available(self, latest_version: str, download_url: str) -> bool:
+        """Callback от ClientUpdater: доступна новая версия.
+
+        Возвращает True, если разрешено обновление, False — если пользователь отложил.
+        Вызывается из фонового потока updater — поэтому работаем через root.after,
+        чтобы всё UI-взаимодействие шло в главном потоке Tkinter.
+        """
+        logger.info(f"on_update_available: {latest_version} ({download_url})")
+
+        # Если headless — updater сам разберётся (вернёт True без нашего участия).
+        # Мы здесь только для случая, когда нужен диалог.
+        # Синхронно запрашиваем у пользователя решение через событие.
+        result_holder = {"allow": False}
+        done_event = threading.Event()
+
+        def _ask_in_main_thread():
+            try:
+                allow = self._ask_user_update_dialog(latest_version)
+                result_holder["allow"] = allow
+            finally:
+                done_event.set()
+
+        self.root.after(0, _ask_in_main_thread)
+
+        # Ждём до 10 минут (пользователь может отойти)
+        done_event.wait(timeout=600)
+        return result_holder["allow"]
+
+    def _ask_user_update_dialog(self, latest_version: str) -> bool:
+        """Показывает модальный диалог «Доступно обновление». Возвращает True/False.
+
+        Должен вызываться ТОЛЬКО из главного потока Tkinter.
+        """
+        from tkinter import messagebox
+
+        current = "?"
+        try:
+            from config import __version__
+            current = __version__
+        except Exception:
+            pass
+
+        text = (
+            f"Доступно обновление клиента.\n\n"
+            f"Текущая версия: {current}\n"
+            f"Новая версия: {latest_version}\n\n"
+            f"Обновление займёт несколько секунд.\n"
+            f"Клиент будет перезапущен автоматически.\n\n"
+            f"Обновить сейчас?"
+        )
+
+        try:
+            answer = messagebox.askyesno(
+                title="CallNotifier — Обновление",
+                message=text,
+                parent=self.root,
+                default="yes",
+            )
+        except Exception as e:
+            logger.error(f"Ошибка в диалоге обновления: {e}")
+            return False
+
+        if answer:
+            logger.info("Пользователь согласился на обновление")
+            return True
+        else:
+            logger.info("Пользователь отложил обновление")
+            return False
+
+    def on_update_state(self, state: str, payload: dict):
+        """Callback от ClientUpdater: изменение состояния обновления.
+
+        Вызывается из фонового потока — переключаемся в главный через root.after.
+        """
+        logger.info(f"on_update_state: {state} {payload}")
+        self.root.after(0, lambda: self._handle_update_state(state, payload or {}))
+
+    def _handle_update_state(self, state: str, payload: dict):
+        """Обновляет UI в зависимости от состояния. Только главный поток."""
+        if state == "downloading":
+            # Показываем/обновляем прогресс-бар
+            total = payload.get("total", 0)
+            downloaded = payload.get("downloaded", 0)
+            self._show_update_progress(downloaded, total)
+        elif state == "ready_to_restart":
+            self._show_update_progress_done(payload.get("version", ""))
+        elif state == "error":
+            self._hide_update_progress()
+            from tkinter import messagebox
+            try:
+                messagebox.showerror(
+                    "CallNotifier — Ошибка обновления",
+                    f"Не удалось обновить клиент:\n{payload.get('message', 'Неизвестная ошибка')}\n\n"
+                    f"Продолжаем работу в текущей версии. Попробуем позже.",
+                    parent=self.root,
+                )
+            except Exception:
+                pass
+
+    def _ensure_update_progress_widgets(self):
+        """Создаёт виджеты прогресс-бара, если их ещё нет."""
+        if getattr(self, "_update_progress_window", None) is not None:
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Обновление CallNotifier")
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        win.configure(bg="#1e1e1e")
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # не закрывать вручную
+
+        # Центрируем
+        win.update_idletasks()
+        w, h = 460, 140
+        try:
+            x = (win.winfo_screenwidth() - w) // 2
+            y = (win.winfo_screenheight() - h) // 2
+            win.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            win.geometry(f"{w}x{h}")
+
+        tk.Label(
+            win, text="Загрузка обновления…",
+            fg="white", bg="#1e1e1e", font=("Arial", 14, "bold")
+        ).pack(pady=(16, 8))
+
+        self._update_progress_label = tk.Label(
+            win, text="", fg="#a0a0a0", bg="#1e1e1e", font=("Arial", 11)
+        )
+        self._update_progress_label.pack()
+
+        self._update_progress_bar = ttk.Progressbar(
+            win, orient="horizontal", length=400, mode="determinate"
+        )
+        self._update_progress_bar.pack(pady=12)
+
+        self._update_progress_window = win
+
+    def _show_update_progress(self, downloaded: int, total: int):
+        """Показывает прогресс-бар с текущим прогрессом."""
+        self._ensure_update_progress_widgets()
+        win = self._update_progress_window
+        bar = self._update_progress_bar
+        lbl = self._update_progress_label
+
+        if total > 0:
+            bar["maximum"] = total
+            bar["value"] = downloaded
+            mb_done = downloaded / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            pct = int(downloaded / total * 100)
+            lbl.config(text=f"{mb_done:.1f} / {mb_total:.1f} МБ ({pct}%)")
+        else:
+            bar["mode"] = "indeterminate"
+            try:
+                bar.start(80)
+            except Exception:
+                pass
+            lbl.config(text=f"Загружено: {downloaded / (1024 * 1024):.1f} МБ")
+
+        try:
+            win.update_idletasks()
+        except Exception:
+            pass
+
+    def _show_update_progress_done(self, version: str):
+        """Показывает завершение загрузки — сейчас будет перезапуск."""
+        self._ensure_update_progress_widgets()
+        win = self._update_progress_window
+        try:
+            self._update_progress_bar.stop()
+        except Exception:
+            pass
+        try:
+            self._update_progress_bar["mode"] = "determinate"
+            self._update_progress_bar["value"] = self._update_progress_bar["maximum"]
+        except Exception:
+            pass
+        try:
+            self._update_progress_label.config(text=f"Версия {version} загружена. Перезапуск…")
+        except Exception:
+            pass
+        try:
+            win.update_idletasks()
+        except Exception:
+            pass
+
+    def _hide_update_progress(self):
+        """Скрывает прогресс-бар."""
+        win = getattr(self, "_update_progress_window", None)
+        if win is not None:
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._update_progress_window = None
 
     def _hide_update_badge(self):
         """Скрывает бейдж обновления, если он показан."""

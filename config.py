@@ -8,7 +8,7 @@ from logger import setup_logger
 # Версия приложения
 # ============================================================================
 
-__version__ = "1.2.0"
+__version__ = "1.4.2"
 
 logger = setup_logger('config')
 
@@ -106,6 +106,12 @@ DEFAULT_CLIENT_CONFIG = {
         "logo_path": "",
         "cache_ttl_days": 3,
         "allowed_types": []
+    },
+    "update": {
+        "enabled": True,
+        "headless_mode": False,
+        "check_interval_hours": 6,
+        "download_retries": 3
     }
 }
 
