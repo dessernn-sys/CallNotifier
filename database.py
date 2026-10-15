@@ -221,11 +221,36 @@ class Database:
     def get_open_calls(self, types_filter: list = None):
         now = time.time()
         with self._lock:
-            # Автоматически закрываем вызовы, у которых вышло forced_close_time
+            # ------------------------------------------------------------------
+            # 1) Автоматическое закрытие по forced_close_time
+            #    (это «ручной» таймер из админки — приоритетнее live_time)
+            # ------------------------------------------------------------------
             self._conn.execute(
-                "UPDATE calls SET status = 'closed', datetime_stop = ? WHERE status = 'open' AND forced_close_time IS NOT NULL AND forced_close_time <= ?",
+                "UPDATE calls SET status = 'closed', datetime_stop = ? "
+                "WHERE status = 'open' AND forced_close_time IS NOT NULL "
+                "AND forced_close_time <= ?",
                 (now, now)
             )
+
+            # ------------------------------------------------------------------
+            # 2) Автоматическое закрытие по live_time_min из types
+            #    Условия:
+            #      * live_time_min > 0 (иначе — «ждать stop», не трогаем)
+            #      * datetime_start + live_time_min * 60 <= now
+            #    Если для типа не нашлось записи в types — не закрываем
+            #    (защита от «висячих» вызовов с неизвестным типом).
+            # ------------------------------------------------------------------
+            self._conn.execute("""
+                UPDATE calls
+                SET status = 'closed', datetime_stop = ?
+                WHERE status = 'open'
+                  AND datetime_start + (
+                        SELECT live_time_min * 60
+                        FROM types WHERE types.type = calls.type
+                      ) <= ?
+                  AND (SELECT live_time_min FROM types WHERE types.type = calls.type) > 0
+            """, (now, now))
+
             self._conn.commit()
 
             if types_filter and len(types_filter) > 0:
@@ -239,7 +264,8 @@ class Database:
             return [{
                 "id": row["id"], "external_id": row["external_id"], "type": row["type"],
                 "name": row["name"], "equipment": row["equipment"], "info": row["info"],
-                "status": row["status"], "datetime_start": row["datetime_start"], "datetime_stop": row["datetime_stop"]
+                "status": row["status"], "datetime_start": row["datetime_start"],
+                "datetime_stop": row["datetime_stop"]
             } for row in rows]
 
     def get_warehouses(self):

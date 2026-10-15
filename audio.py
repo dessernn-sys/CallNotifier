@@ -55,6 +55,11 @@ class AudioManager:
         self._played_filenames = set()
         self._played_reminders = set()
 
+        # Файлы, которые сейчас качаются — чтобы не запускать скачивание
+        # одного и того же файла несколько раз подряд (гонка sync-циклов).
+        self._downloading = set()
+        self._downloading_lock = threading.Lock()
+
         self._current_calls = []
         self._warehouses = []
 
@@ -63,12 +68,96 @@ class AudioManager:
         self._latest_url = None           # например, "/static/client/CallNotifierClient-1.1.0.exe"
         self._version_callback = None     # колбэк в GUI для обновления бейджа
 
-        pygame.mixer.quit()
-        pygame.mixer.init(frequency=48000)
-        logger.info("Микшер pygame инициализирован")
+        # ---------- Инициализация аудио (graceful) ----------
+        # pygame.mixer.init() может упасть, если:
+        #   * нет звуковой карты;
+        #   * отключены наушники (WASAPI не находит endpoint);
+        #   * драйвер занят другим приложением.
+        # Не даём этому уронить весь клиент — работаем без звука.
+        self._audio_available = False
+        self._audio_lock = threading.Lock()
+        self._audio_retry_thread = None
+        self._stop_audio_retry = threading.Event()
+
+        self._try_init_audio()
 
         self._start_player_thread()
         self._start_sync_thread()
+        self._start_audio_retry_thread()
+
+    # ========================================================================
+    # АУДИО: инициализация и переподключение
+    # ========================================================================
+
+    def _try_init_audio(self) -> bool:
+        """Пытается инициализировать pygame.mixer. Возвращает True при успехе.
+
+        Не бросает исключений — при любой ошибке возвращает False и логирует.
+        """
+        with self._audio_lock:
+            if self._audio_available:
+                return True
+            try:
+                try:
+                    pygame.mixer.quit()
+                except Exception:
+                    pass
+
+                pygame.mixer.init(frequency=48000)
+                self._audio_available = True
+                logger.info("Микшер pygame инициализирован")
+                return True
+            except pygame.error as e:
+                self._audio_available = False
+                logger.warning(
+                    f"⚠ Аудиоустройство недоступно ({e}). "
+                    f"Клиент продолжит работу без звука. "
+                    f"Повторные попытки — раз в 30 сек."
+                )
+                return False
+            except Exception as e:
+                self._audio_available = False
+                logger.warning(f"⚠ Непредвиденная ошибка инициализации аудио: {e}")
+                return False
+
+    def _start_audio_retry_thread(self):
+        """Запускает фоновый поток, который раз в 30 сек пытается поднять звук,
+        если он ещё не поднят."""
+        if self._audio_available:
+            return
+        if self._audio_retry_thread and self._audio_retry_thread.is_alive():
+            return
+        self._stop_audio_retry.clear()
+        self._audio_retry_thread = threading.Thread(
+            target=self._audio_retry_loop, daemon=True, name="AudioRetryLoop"
+        )
+        self._audio_retry_thread.start()
+
+    def _audio_retry_loop(self):
+        """Раз в 30 секунд пробуем поднять звук. Как только получилось — выходим."""
+        while not self._stop_audio_retry.is_set():
+            if self._stop_audio_retry.wait(30):
+                break
+            if self._audio_available:
+                logger.info("Аудиоустройство поднято, поток retry завершён.")
+                return
+            if self._try_init_audio():
+                logger.info("✅ Аудиоустройство стало доступно. Звук включён.")
+                return
+        logger.info("Поток retry аудио остановлен.")
+
+    def is_audio_available(self) -> bool:
+        """Публичный метод для GUI — узнать, работает ли звук сейчас."""
+        return self._audio_available
+
+    def reconnect_audio(self) -> bool:
+        """Ручная попытка переподключить звук (для кнопки в F1)."""
+        ok = self._try_init_audio()
+        if ok:
+            logger.info("Ручное переподключение аудио успешно.")
+        else:
+            logger.warning("Ручное переподключение аудио не удалось.")
+        return ok
 
     # ========================================================================
     # CALLBACK-И ДЛЯ GUI
@@ -221,10 +310,20 @@ class AudioManager:
             local_path = os.path.join(self.client_cache_dir, filename)
 
             if filename not in self._played_filenames:
+                # Защита от гонки: если файл уже качается другим потоком — не дублируем
+                with self._downloading_lock:
+                    already = filename in self._downloading
+                    if not already:
+                        self._downloading.add(filename)
+                if already:
+                    continue
+
                 if os.path.exists(local_path) and os.path.getsize(local_path) == expected_size:
                     self._play_queue.put(local_path)
                     self._played_filenames.add(filename)
                     logger.info(f"Новый вызов поставлен в очередь: {filename}")
+                    with self._downloading_lock:
+                        self._downloading.discard(filename)
                 else:
                     self._download_audio(filename, expected_size, local_path)
 
@@ -233,26 +332,52 @@ class AudioManager:
         for call_type, reminder_filename in reminders_due.items():
             reminder_key = f"{call_type}_{reminder_filename}"
             if reminder_key not in self._played_reminders:
+                # Защита от гонки
+                with self._downloading_lock:
+                    already = reminder_key in self._downloading
+                    if not already:
+                        self._downloading.add(reminder_key)
+                if already:
+                    continue
+
                 local_path = os.path.join(self.client_cache_dir, reminder_filename)
                 if os.path.exists(local_path):
                     self._play_queue.put(local_path)
                     self._played_reminders.add(reminder_key)
                     logger.info(f"Напоминание поставлено в очередь: {reminder_filename}")
+                    with self._downloading_lock:
+                        self._downloading.discard(reminder_key)
                 else:
-                    threading.Thread(target=self._download_reminder, args=(reminder_filename, local_path, reminder_key),
-                                     daemon=True).start()
+                    threading.Thread(
+                        target=self._download_reminder,
+                        args=(reminder_filename, local_path, reminder_key),
+                        daemon=True
+                    ).start()
 
         for filename in warehouse_alerts:
             alert_key = f"warehouse_{filename}"
             if alert_key not in self._played_reminders:
+                # Защита от гонки: файл может качаться прямо сейчас другим потоком
+                with self._downloading_lock:
+                    already = alert_key in self._downloading
+                    if not already:
+                        self._downloading.add(alert_key)
+                if already:
+                    continue
+
                 local_path = os.path.join(self.client_cache_dir, filename)
                 if os.path.exists(local_path):
                     self._play_queue.put(local_path)
                     self._played_reminders.add(alert_key)
                     logger.info(f"Складское оповещение из кэша поставлено в очередь: {filename}")
+                    with self._downloading_lock:
+                        self._downloading.discard(alert_key)
                 else:
-                    threading.Thread(target=self._download_wh_alert, args=(filename, local_path, alert_key),
-                                     daemon=True).start()
+                    threading.Thread(
+                        target=self._download_wh_alert,
+                        args=(filename, local_path, alert_key),
+                        daemon=True
+                    ).start()
 
         # ---------- Очистка трекера сыгранных напоминаний ----------
         # Ключи, которые сервер больше не присылает, должны быть удалены,
@@ -284,29 +409,40 @@ class AudioManager:
             logger.info(f"Складское оповещение скачано и поставлено в очередь: {filename}")
         except Exception as e:
             logger.warning(f"Не удалось скачать складское оповещение {filename}: {e}")
+        finally:
+            with self._downloading_lock:
+                self._downloading.discard(alert_key)
 
     def _download_audio(self, filename, expected_size, local_path):
         url = f"{self.server_url}/api/v1/audio/{filename}"
-        for attempt in range(3):
-            try:
-                response = requests.get(url, timeout=8)
-                response.raise_for_status()
-                with open(local_path, 'wb') as f:
-                    f.write(response.content)
+        try:
+            for attempt in range(3):
+                try:
+                    response = requests.get(url, timeout=8)
+                    response.raise_for_status()
+                    with open(local_path, 'wb') as f:
+                        f.write(response.content)
 
-                if expected_size == 0 or os.path.getsize(local_path) == expected_size:
-                    self._play_queue.put(local_path)
-                    self._played_filenames.add(filename)
-                    logger.info(f"Успешно скачано и поставлено в очередь: {filename}")
-                    return
-                else:
-                    logger.warning(
-                        f"Попытка {attempt + 1}: Размер файла {filename} ({os.path.getsize(local_path)} байт) не совпадает с ожидаемым ({expected_size} байт). Удаление.")
-                    os.remove(local_path)
-            except Exception as e:
-                logger.warning(f"Попытка {attempt + 1} скачать {filename} не удалась: {e}")
-                time.sleep(1)
-        logger.error(f"Не удалось скачать {filename} после 3 попыток. Файл будет запрошен снова при следующей синхронизации.")
+                    if expected_size == 0 or os.path.getsize(local_path) == expected_size:
+                        self._play_queue.put(local_path)
+                        self._played_filenames.add(filename)
+                        logger.info(f"Успешно скачано и поставлено в очередь: {filename}")
+                        return
+                    else:
+                        logger.warning(
+                            f"Попытка {attempt + 1}: Размер файла {filename} "
+                            f"({os.path.getsize(local_path)} байт) не совпадает с ожидаемым "
+                            f"({expected_size} байт). Удаление."
+                        )
+                        os.remove(local_path)
+                except Exception as e:
+                    logger.warning(f"Попытка {attempt + 1} скачать {filename} не удалась: {e}")
+                    time.sleep(1)
+            logger.error(f"Не удалось скачать {filename} после 3 попыток. "
+                         f"Файл будет запрошен снова при следующей синхронизации.")
+        finally:
+            with self._downloading_lock:
+                self._downloading.discard(filename)
 
     def _download_reminder(self, filename, local_path, reminder_key):
         url = f"{self.server_url}/api/v1/audio/{filename}"
@@ -320,6 +456,9 @@ class AudioManager:
             logger.info(f"Напоминание скачано и поставлено в очередь: {filename}")
         except Exception as e:
             logger.warning(f"Не удалось скачать напоминание {filename}: {e}")
+        finally:
+            with self._downloading_lock:
+                self._downloading.discard(reminder_key)
 
     def set_version_callback(self, callback):
         """Callback вызывается при изменении информации о версии."""
@@ -345,15 +484,26 @@ class AudioManager:
                 wav_path = self._play_queue.get(timeout=1)
             except queue.Empty:
                 continue
+
+            # Если звука нет — просто достаём файл из очереди и идём дальше.
+            # Так очередь не забивается, а при появлении звука клиент
+            # сразу начнёт играть новые алерты (но не «накопленные»).
+            if not self._audio_available:
+                logger.debug(f"Пропуск воспроизведения (звук недоступен): {wav_path}")
+                continue
+
             try:
                 sound = pygame.mixer.Sound(wav_path)
                 sound.play()
                 while pygame.mixer.get_busy() and not self._stop_player.is_set():
                     time.sleep(0.1)
+            except pygame.error as e:
+                # Если звук отвалился прямо во время игры — помечаем как недоступный
+                logger.warning(f"Ошибка воспроизведения (звук пропал?): {e}")
+                self._audio_available = False
+                self._start_audio_retry_thread()
             except Exception as e:
                 logger.error(f"Ошибка воспроизведения: {e}")
-            finally:
-                pass
 
     # ========================================================================
     # СОВМЕСТИМОСТЬ
@@ -384,9 +534,15 @@ class AudioManager:
     def shutdown(self):
         self._stop_sync.set()
         self._stop_player.set()
+        self._stop_audio_retry.set()
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=2)
         if self._player_thread and self._player_thread.is_alive():
             self._player_thread.join(timeout=2)
-        pygame.mixer.quit()
+        if self._audio_retry_thread and self._audio_retry_thread.is_alive():
+            self._audio_retry_thread.join(timeout=2)
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
         logger.info("AudioManager завершил работу")

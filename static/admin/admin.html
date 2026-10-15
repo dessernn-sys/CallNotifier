@@ -114,10 +114,15 @@
                 <input type="text" id="cf-equipment" placeholder="Станок №5">
             </div>
 
-            <div class="form-row">
-                <label for="cf-info">Дополнительная информация</label>
-                <input type="text" id="cf-info" placeholder="Комментарий (необязательно)">
-            </div>
+			<div class="form-row" style="grid-template-columns: 220px 1fr; align-items: start;">
+				<label for="cf-info" style="padding-top: 8px;">Дополнительная информация</label>
+				<textarea id="cf-info" rows="4"
+					placeholder="Комментарий (необязательно). Можно несколько строк."
+					style="width: 100%; padding: 8px 12px; background: var(--bg-elev-2);
+						border: 1px solid var(--border); border-radius: 6px;
+						color: var(--text); font-family: inherit; font-size: 13px;
+						resize: vertical;"></textarea>
+			</div>
 
             <div class="form-row">
                 <label for="cf-forced">Автоматически закрыть через</label>

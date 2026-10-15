@@ -114,16 +114,78 @@ class SettingsDialog:
             foreground="gray",
         ).grid(row=7, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
 
+        # ---------- Статус аудиоустройства ----------
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=(16, 8)
+        )
+
+        ttk.Label(
+            frame, text="Аудиоустройство", font=("Arial", 10, "bold")
+        ).grid(row=9, column=0, columnspan=3, padx=10, pady=(0, 4), sticky="w")
+
+        self.audio_status_var = tk.StringVar(value="—")
+        self.audio_status_label = ttk.Label(
+            frame, textvariable=self.audio_status_var, foreground="#4ec9b0"
+        )
+        self.audio_status_label.grid(row=10, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+
+        ttk.Button(
+            frame,
+            text="🔊 Переподключить звук",
+            command=self._on_reconnect_audio,
+        ).grid(row=11, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+
         # Версия клиента (для диагностики)
         from config import __version__ as _ver
         ttk.Label(
             frame,
             text=f"Версия клиента: v{_ver}",
             foreground="#4ec9b0",
-        ).grid(row=8, column=0, columnspan=3, padx=10, pady=(8, 4), sticky="w")
+        ).grid(row=12, column=0, columnspan=3, padx=10, pady=(8, 4), sticky="w")
+
+        # Обновляем статус аудио при открытии
+        self._refresh_audio_status()
 
         frame.columnconfigure(1, weight=1)
 
+    def _refresh_audio_status(self):
+        """Обновляет текст статуса аудиоустройства."""
+        if self.audio is None:
+            self.audio_status_var.set("Аудио-менеджер недоступен")
+            return
+        try:
+            available = self.audio.is_audio_available()
+        except Exception:
+            available = False
+        if available:
+            self.audio_status_var.set("🔊 Звук: доступен")
+            self.audio_status_label.configure(foreground="#4ec9b0")
+        else:
+            self.audio_status_var.set("🔇 Звук: НЕДОСТУПЕН (наушники/колонки не найдены)")
+            self.audio_status_label.configure(foreground="#ff6b6b")
+
+    def _on_reconnect_audio(self):
+        """Ручное переподключение звука (кнопка)."""
+        if self.audio is None:
+            messagebox.showwarning("Звук", "Аудио-менеджер недоступен.", parent=self.dialog)
+            return
+        try:
+            ok = self.audio.reconnect_audio()
+        except Exception as e:
+            logger.error(f"Ошибка переподключения аудио: {e}")
+            ok = False
+
+        self._refresh_audio_status()
+        if ok:
+            messagebox.showinfo("Звук", "Аудиоустройство подключено.", parent=self.dialog)
+        else:
+            messagebox.showwarning(
+                "Звук",
+                "Не удалось подключить аудио.\n"
+                "Проверьте, подключены ли наушники/колонки,\n"
+                "и попробуйте ещё раз.",
+                parent=self.dialog,
+            )
 
     def _update_ttl_label(self, event=None):
         val = int(self.ttl_var.get())
